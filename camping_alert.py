@@ -1,8 +1,9 @@
 """대전상소오토캠핑장 토·일 입실 빈자리 텔레그램 알림.
 
 사용법:
-  python camping_alert.py          # 1회 확인 (작업 스케줄러가 5분마다 실행)
+  python camping_alert.py          # 1회 확인 (GitHub Actions가 매시간 실행)
   python camping_alert.py --test   # 텔레그램 테스트 메시지 + 현재 빈자리 출력
+텔레그램 명령: /on 켜기, /off 끄기, /status 상태 (다음 정기 실행 때 반영)
 """
 import datetime as dt
 import json
@@ -32,6 +33,10 @@ SLOT_RE = re.compile(r'name="rsv_info" value="[^#]*#@\d+#@(\d{4}-\d{2}-\d{2})#@[
                      r'<button[^>]*class="rsv_ok"[^>]*>.*?/>\s*([^<*]+?)\s*\*?</button>', re.S)
 
 
+class SiteClosed(Exception):
+    pass
+
+
 def log(msg):
     line = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
     print(line)
@@ -43,7 +48,10 @@ def fetch(year, month, zone):
     r = requests.post(URL, data={"wh_year": year, "wh_month": month, "man": zone},
                       headers={"User-Agent": "Mozilla/5.0"}, timeout=20, verify=False)
     r.raise_for_status()
-    return r.content.decode("cp949", errors="replace")
+    html = r.content.decode("cp949", errors="replace")
+    if "calendar_t" not in html:  # 매월 1일 10시 전 등 사이트가 안내 페이지로 돌려보냄
+        raise SiteClosed("예약 달력이 열리지 않음 (매월 1일 오전 10시 전 등)")
+    return html
 
 
 def available_slots():
@@ -87,22 +95,66 @@ def format_msg(slots):
 
 def main():
     requests.packages.urllib3.disable_warnings()
-    now = available_slots()
 
     if "--test" in sys.argv:
+        now = available_slots()
         print(format_msg(now) if now else "현재 토·일 입실 빈자리 없음")
         send_telegram("✅ 캠핑장 알림 테스트 성공\n현재 토·일 빈자리 " + f"{len(now)}건")
         print("텔레그램 전송 완료")
         return
 
-    prev = set(json.loads(STATE_FILE.read_text(encoding="utf-8"))) if STATE_FILE.exists() else None
-    new = now - prev if prev is not None else now
-    if new:
-        send_telegram(format_msg(new))
-        log(f"알림 전송: 새 빈자리 {len(new)}건 (전체 {len(now)}건)")
+    state = load_state()
+    handle_commands(state)
+    if not state["enabled"]:
+        log("알림 꺼짐 - 조회 생략")
     else:
-        log(f"새 빈자리 없음 (전체 {len(now)}건)")
-    STATE_FILE.write_text(json.dumps(sorted(now), ensure_ascii=False), encoding="utf-8")
+        try:
+            now = available_slots()
+        except SiteClosed as e:
+            log(f"조회 건너뜀: {e}")  # 기록은 그대로 둬서 10시 이후 중복 알림 방지
+        else:
+            prev = set(state["slots"]) if state["slots"] is not None else set()
+            new = now - prev
+            if new:
+                send_telegram(format_msg(new))
+                log(f"알림 전송: 새 빈자리 {len(new)}건 (전체 {len(now)}건)")
+            else:
+                log(f"새 빈자리 없음 (전체 {len(now)}건)")
+            state["slots"] = sorted(now)
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def load_state():
+    s = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+    if isinstance(s, list):  # 이전 형식(빈자리 목록만 저장)
+        s = {"slots": s}
+    return {"enabled": True, "offset": 0, "slots": None, **s}
+
+
+def handle_commands(state):
+    """텔레그램 명령 처리. 정기 실행 때 한꺼번에 읽으므로 답장은 다음 실행 시각에 온다."""
+    api = f"https://api.telegram.org/bot{CONFIG['telegram_token']}"
+    requests.post(f"{api}/setMyCommands", json={"commands": [
+        {"command": "on", "description": "알림 켜기"},
+        {"command": "off", "description": "알림 끄기"},
+        {"command": "status", "description": "현재 상태·빈자리"}]}, timeout=20)
+    r = requests.get(f"{api}/getUpdates", params={"offset": state["offset"] + 1}, timeout=20)
+    for u in r.json().get("result", []):
+        state["offset"] = u["update_id"]
+        msg = u.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(CONFIG["telegram_chat_id"]):
+            continue  # 내 채팅 외 명령 무시
+        cmd = msg.get("text", "").strip().split("@")[0]
+        if cmd in ("/on", "켜기"):
+            state["enabled"] = True
+            send_telegram("🔔 알림을 켰습니다.")
+        elif cmd in ("/off", "끄기"):
+            state["enabled"] = False
+            send_telegram("🔕 알림을 껐습니다. 다시 켜려면 /on")
+        elif cmd in ("/status", "상태"):
+            slots = set(state["slots"] or [])
+            head = f"현재 알림: {'켜짐 🔔' if state['enabled'] else '꺼짐 🔕'}\n토·일 빈자리 {len(slots)}건"
+            send_telegram(head + ("\n\n" + format_msg(slots) if slots else ""))
 
 
 if __name__ == "__main__":
