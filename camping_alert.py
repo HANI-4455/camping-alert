@@ -18,6 +18,7 @@ URL = "https://www.sangsocamping.kr:453/reservation.asp?location=002"
 ZONES = {1: "A구역(파쇄석)", 2: "B구역(강자갈)", 3: "C구역(강자갈)", 4: "D구역(파쇄석)", 5: "E구역(데크)"}
 WEEKEND = {5: "토", 6: "일"}  # 입실 요일
 MAX_MONTHS = 3
+KST = dt.timezone(dt.timedelta(hours=9))  # GitHub 서버는 UTC라서 한국 시간 기준으로 계산
 
 BASE = Path(__file__).parent
 # GitHub Actions에서는 Secrets(환경변수), PC에서는 config.json
@@ -56,7 +57,7 @@ def fetch(year, month, zone):
 
 def available_slots():
     """{ '2026-10-03|A구역01', ... } 오늘 이후 토·일 입실 예약가능 사이트."""
-    today = dt.date.today()
+    today = dt.datetime.now(KST).date()
     slots = set()
     for zone in ZONES:
         y, m = today.year, today.month
@@ -105,14 +106,23 @@ def main():
 
     state = load_state()
     handle_commands(state)
+    kst_now = dt.datetime.now(KST)
     if not state["enabled"]:
         log("알림 꺼짐 - 조회 생략")
+    elif kst_now.day == 1 and kst_now.hour < 10:
+        log("매월 1일 오전 10시 전 - 사이트 이용 불가 시간이라 조회 생략")
     else:
         try:
             now = available_slots()
         except SiteClosed as e:
             log(f"조회 건너뜀: {e}")  # 기록은 그대로 둬서 10시 이후 중복 알림 방지
+        except requests.RequestException as e:
+            state["fails"] += 1
+            log(f"사이트 접속 실패 {state['fails']}회 연속: {e!r}")
+            if state["fails"] == 6:
+                send_telegram("⚠️ 캠핑장 사이트에 6회 연속 접속하지 못했습니다. 알림이 늦거나 오지 않을 수 있습니다.")
         else:
+            state["fails"] = 0
             prev = set(state["slots"]) if state["slots"] is not None else set()
             new = now - prev
             if new:
@@ -128,7 +138,7 @@ def load_state():
     s = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
     if isinstance(s, list):  # 이전 형식(빈자리 목록만 저장)
         s = {"slots": s}
-    return {"enabled": True, "offset": 0, "slots": None, **s}
+    return {"enabled": True, "offset": 0, "slots": None, "fails": 0, **s}
 
 
 def handle_commands(state):
